@@ -159,7 +159,7 @@ class NetworkBootstrapper {
     }
 
     private fun generateNodeInfos(nodeDirs: List<Path>, numConcurrentProcesses: Int): List<Path> {
-        val executor = Executors.newFixedThreadPool(numConcurrentProcesses) // TODO: Expose `nThreads` as command line arg.
+        val executor = Executors.newFixedThreadPool(numConcurrentProcesses)
         val nodeInfos = nodeDirs.map { executor.fork { generateNodeInfo(it) } }.transpose().get()
         executor.shutdownNow()
         return nodeInfos
