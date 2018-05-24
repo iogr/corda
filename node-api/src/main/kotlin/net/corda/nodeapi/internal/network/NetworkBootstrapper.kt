@@ -160,9 +160,11 @@ class NetworkBootstrapper {
 
     private fun generateNodeInfos(nodeDirs: List<Path>, numConcurrentProcesses: Int): List<Path> {
         val executor = Executors.newFixedThreadPool(numConcurrentProcesses)
-        val nodeInfos = nodeDirs.map { executor.fork { generateNodeInfo(it) } }.transpose().get()
-        executor.shutdownNow()
-        return nodeInfos
+        return try {
+            nodeDirs.map { executor.fork { generateNodeInfo(it) } }.transpose().get()
+        } finally {
+            executor.shutdownNow()
+        }
     }
 
     private fun generateNodeInfo(nodeDir: Path): Path {
@@ -175,6 +177,9 @@ class NetworkBootstrapper {
                 .start()
         if (!process.waitFor(60, TimeUnit.SECONDS)) {
             process.destroyForcibly()
+            throw Error("Error while generating node info file. Please check the logs in $logsDir.")
+        }
+        if (process.exitValue() != 0) {
             throw Error("Error while generating node info file. Please check the logs in $logsDir.")
         }
         return nodeDir.list { paths -> paths.filter { it.fileName.toString().startsWith(NODE_INFO_FILE_NAME_PREFIX) }.findFirst().get() }
