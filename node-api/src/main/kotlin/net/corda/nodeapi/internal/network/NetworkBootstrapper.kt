@@ -8,6 +8,7 @@ import net.corda.core.identity.CordaX500Name
 import net.corda.core.identity.Party
 import net.corda.core.internal.*
 import net.corda.core.internal.concurrent.fork
+import net.corda.core.internal.concurrent.transpose
 import net.corda.core.node.NetworkParameters
 import net.corda.core.node.NodeInfo
 import net.corda.core.node.NotaryInfo
@@ -29,17 +30,33 @@ import net.corda.serialization.internal.amqp.AbstractAMQPSerializationScheme
 import net.corda.serialization.internal.amqp.amqpMagic
 import net.corda.serialization.internal.kryo.AbstractKryoSerializationScheme
 import net.corda.serialization.internal.kryo.kryoMagic
+import picocli.CommandLine
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.time.Instant
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import kotlin.streams.toList
 import kotlin.collections.HashSet
 import kotlin.collections.component1
 import kotlin.collections.component2
 import kotlin.collections.set
+
+class Args {
+    @CommandLine.Option(names = ["-n", "--num-concurrent-processes"], description = ["The number of concurrent processes to generate node info files (default: 4)."])
+    var nrProcesses = 4 // TODO: validate > 0
+
+    @CommandLine.Option(names = ["-h", "--help"], usageHelp = true, description = ["Display this help message."])
+    var usageHelpRequested = false
+
+    @CommandLine.Parameters(arity = "1", paramLabel = "DIR", description = ["The base directory."])
+    var baseDir = Paths.get(".")
+
+    @CommandLine.Parameters(arity = "0..*", paramLabel = "JAR", description = ["The cordapp JAR(s)."])
+    var cordappJars = arrayOf<Path>()
+}
 
 /**
  * Class to bootstrap a local network of Corda nodes on the same filesystem.
@@ -59,9 +76,16 @@ class NetworkBootstrapper {
 
         @JvmStatic
         fun main(args: Array<String>) {
-            val baseNodeDirectory = requireNotNull(args.firstOrNull()) { "Expecting first argument which is the nodes' parent directory" }
-            val cordappJars = if (args.size > 1) args.asList().drop(1).map { Paths.get(it) } else emptyList()
-            NetworkBootstrapper().bootstrap(Paths.get(baseNodeDirectory).toAbsolutePath().normalize(), cordappJars)
+            val params = Args()
+            val cl = CommandLine(params).parse(*args)
+            if (params.usageHelpRequested) {
+                CommandLine.usage(Args(), System.out)
+                return
+            }
+
+            val baseNodeDirectory = params.baseDir
+            val cordappJars = params.cordappJars.toList()
+            NetworkBootstrapper().bootstrap(baseNodeDirectory.toAbsolutePath().normalize(), cordappJars, params.nrProcesses)
         }
     }
 
@@ -102,7 +126,7 @@ class NetworkBootstrapper {
         }
     }
 
-    fun bootstrap(directory: Path, cordappJars: List<Path>) {
+    fun bootstrap(directory: Path, cordappJars: List<Path>, numConcurrentProcesses: Int) {
         directory.createDirectories()
         println("Bootstrapping local network in $directory")
         generateDirectoriesIfNeeded(directory, cordappJars)
@@ -111,11 +135,10 @@ class NetworkBootstrapper {
         println("Nodes found in the following sub-directories: ${nodeDirs.map { it.fileName }}")
         val configs = nodeDirs.associateBy({ it }, { ConfigFactory.parseFile((it / "node.conf").toFile()) })
         generateServiceIdentitiesForNotaryClusters(configs)
-        val processes = startNodeInfoGeneration(nodeDirs)
         initialiseSerialization()
         try {
             println("Waiting for all nodes to generate their node-info files...")
-            val nodeInfoFiles = gatherNodeInfoFiles(processes, nodeDirs)
+            val nodeInfoFiles = generateNodeInfos(nodeDirs, numConcurrentProcesses)
             println("Checking for duplicate nodes")
             checkForDuplicateLegalNames(nodeInfoFiles)
             println("Distributing all node-info files to all nodes")
@@ -132,8 +155,29 @@ class NetworkBootstrapper {
             println("Bootstrapping complete!")
         } finally {
             _contextSerializationEnv.set(null)
-            processes.forEach { if (it.isAlive) it.destroyForcibly() }
         }
+    }
+
+    private fun generateNodeInfos(nodeDirs: List<Path>, numConcurrentProcesses: Int): List<Path> {
+        val executor = Executors.newFixedThreadPool(numConcurrentProcesses) // TODO: Expose `nThreads` as command line arg.
+        val nodeInfos = nodeDirs.map { executor.fork { generateNodeInfo(it) } }.transpose().get()
+        executor.shutdownNow()
+        return nodeInfos
+    }
+
+    private fun generateNodeInfo(nodeDir: Path): Path {
+        val logsDir = (nodeDir / LOGS_DIR_NAME).createDirectories()
+        val process = ProcessBuilder(nodeInfoGenCmd)
+                .directory(nodeDir.toFile())
+                .redirectErrorStream(true)
+                .redirectOutput((logsDir / "node-info-gen.log").toFile())
+                .apply { environment()["CAPSULE_CACHE_DIR"] = "../.cache" }
+                .start()
+        if (!process.waitFor(60, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            throw Error("Error while generating node info file. Please check the logs in $logsDir.")
+        }
+        return nodeDir.list { paths -> paths.filter { it.fileName.toString().startsWith(NODE_INFO_FILE_NAME_PREFIX) }.findFirst().get() }
     }
 
     private fun generateDirectoriesIfNeeded(directory: Path, cordappJars: List<Path>) {
